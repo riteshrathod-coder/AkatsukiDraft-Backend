@@ -25,7 +25,7 @@ app.use(morgan('dev'));
 
 // Root / Welcome route
 app.get('/', (req, res) => {
-  res.json("Akatsuki's Draft API is running......");
+  res.send("Akatsuki's Draft API is running......");
 });
 
 // Health check
