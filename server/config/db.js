@@ -1,45 +1,106 @@
 import mongoose from 'mongoose';
-import config from './env.js';
+import config, { getEnvDiagnostics } from './env.js';
 
-let isConnecting = false;
-
-export const connectDB = async () => {
-  // Return immediately if already connected
-  if (mongoose.connection.readyState >= 1) {
-    return;
-  }
-
-  // Prevent duplicate simultaneous connection attempts
-  if (isConnecting) {
-    while (isConnecting) {
-      await new Promise(resolve => setTimeout(resolve, 100));
-    }
-    return;
-  }
-
-  if (!config.mongoUri || config.mongoUri.includes('localhost')) {
-    if (process.env.NODE_ENV === 'production' || !process.env.MONGODB_URI) {
-      console.warn('[DB Warning] MONGODB_URI is not set in environment variables!');
-    }
-  }
-
+// Safe helper to extract cluster hostname without exposing username or password
+export const getMaskedCluster = (uri) => {
+  if (!uri) return 'NOT_CONFIGURED';
   try {
-    isConnecting = true;
-    const conn = await mongoose.connect(config.mongoUri, {
-      serverSelectionTimeoutMS: 5000, // Timeout after 5s instead of hanging indefinitely
-    });
-    console.log(`[DB] Connected: ${conn.connection.host}`);
-  } catch (error) {
-    console.error(`[DB] Connection failed: ${error.message}`);
-    throw error;
-  } finally {
-    isConnecting = false;
+    const match = uri.match(/@([^/?#]+)/);
+    return match ? match[1] : (uri.includes('localhost') ? 'localhost' : 'custom-host');
+  } catch {
+    return 'UNKNOWN';
   }
 };
 
+// Global cache for serverless environments (preserves connection across invocations)
+let cached = global.mongoose;
+if (!cached) {
+  cached = global.mongoose = { conn: null, promise: null };
+}
+
+export const connectDB = async () => {
+  // 1. If already connected, return cached connection immediately
+  if (cached.conn && mongoose.connection.readyState === 1) {
+    return cached.conn;
+  }
+
+  // 2. Safe diagnostic check on environment configuration
+  const diagnostics = getEnvDiagnostics();
+  if (!diagnostics.hasMongoUri) {
+    console.warn('[DB Diagnostic] MONGODB_URI is NOT set in environment variables! Using fallback localhost.');
+  }
+
+  // 3. If a connection is already in progress, await the existing promise
+  if (cached.promise) {
+    try {
+      cached.conn = await cached.promise;
+      return cached.conn;
+    } catch (err) {
+      cached.promise = null;
+      throw err;
+    }
+  }
+
+  // 4. Initiate connection with serverless-optimized options
+  const connectionOptions = {
+    serverSelectionTimeoutMS: 10000, // 10s gives cold start TLS & DNS time without exceeding function limits
+    connectTimeoutMS: 10000,
+    socketTimeoutMS: 45000,
+    family: 4,                      // Use IPv4, skip IPv6 resolution delays on cloud networks
+    maxPoolSize: 10,
+  };
+
+  const maskedHost = getMaskedCluster(config.mongoUri);
+
+  cached.promise = mongoose.connect(config.mongoUri, connectionOptions)
+    .then((m) => {
+      console.log(`[DB] Connected successfully to cluster: ${maskedHost}`);
+      return m;
+    })
+    .catch((error) => {
+      cached.promise = null; // Reset promise so next invocation can retry
+      cached.conn = null;
+
+      // Safe diagnostic error logging without exposing credentials or secrets
+      console.error('[DB] Connection failed details:', {
+        errorName: error.name || 'ConnectionError',
+        errorCode: error.code || error.cause?.code || 'NO_CODE',
+        targetCluster: maskedHost,
+        message: error.message ? error.message.replace(/\/\/([^:]+):([^@]+)@/, '//$1:****@') : 'Unknown error',
+      });
+      throw error;
+    });
+
+  try {
+    cached.conn = await cached.promise;
+    return cached.conn;
+  } catch (error) {
+    cached.promise = null;
+    throw error;
+  }
+};
+
+export const getConnectionStatus = () => {
+  const stateMap = {
+    0: 'disconnected',
+    1: 'connected',
+    2: 'connecting',
+    3: 'disconnecting',
+  };
+  return {
+    state: stateMap[mongoose.connection.readyState] || 'unknown',
+    readyState: mongoose.connection.readyState,
+    cluster: getMaskedCluster(config.mongoUri),
+  };
+};
+
 export const disconnectDB = async () => {
-  await mongoose.disconnect();
-  console.log('[DB] Disconnected');
+  if (mongoose.connection.readyState !== 0) {
+    await mongoose.disconnect();
+    cached.conn = null;
+    cached.promise = null;
+    console.log('[DB] Disconnected');
+  }
 };
 
 export default connectDB;
