@@ -33,6 +33,19 @@ app.get('/api/health', (req, res) => {
   res.json({ success: true, message: 'API is running' });
 });
 
+// Ensure database is connected before processing requests (vital for serverless/cold starts)
+app.use(async (req, res, next) => {
+  try {
+    await connectDB();
+    next();
+  } catch (err) {
+    return res.status(500).json({
+      success: false,
+      message: `Database connection error: ${err.message}. Check MONGODB_URI and MongoDB Atlas IP Access (0.0.0.0/0).`
+    });
+  }
+});
+
 // Mount Routes
 app.use('/api/auth', authRoutes);
 app.use('/api/posts', postRoutes);
